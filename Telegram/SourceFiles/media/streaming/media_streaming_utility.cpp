@@ -229,7 +229,7 @@ bool ApplyVsrUpscale(
 		if (FAILED(hr)) return false;
 
 		NVVSR_EXTENSION_PAYLOAD payload = { 1 };
-		vsr->videoContext->VideoProcessorSetStreamExtension(vsr->processor, 0, NVVSR_D3D11_EXTENSION_GUID, sizeof(payload), &payload);
+		vsr->videoContext->VideoProcessorSetStreamExtension(vsr->processor, 0, &NVVSR_D3D11_EXTENSION_GUID, sizeof(payload), &payload);
 
 		D3D11_TEXTURE2D_DESC texDesc = {};
 		texDesc.Width = vsr->outWidth;
