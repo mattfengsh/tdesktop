@@ -1576,6 +1576,9 @@ void OverlayWidget::clearStreaming(bool savePosition) {
 			_document,
 			_streamed->instance.player().prepareLegacyState());
 	}
+	if (_streamed && _document && _document->loading()) {
+		_document->cancel();
+	}
 	_fullScreenVideo = false;
 	_streamed = nullptr;
 }
