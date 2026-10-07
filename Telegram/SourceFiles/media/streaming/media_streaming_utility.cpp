@@ -12,6 +12,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/painter.h"
 #include "ffmpeg/ffmpeg_utility.h"
 
+#include <cmath>
+
+#ifdef Q_OS_WIN
+#include <d3d11.h>
+#include <d3d11_1.h>
+extern "C" {
+#include <libavutil/hwcontext_d3d11va.h>
+}
+#endif
 namespace Media {
 namespace Streaming {
 namespace {
@@ -115,11 +124,208 @@ bool GoodForRequest(
 	return (size == request.outer) && (size == image.size());
 }
 
+#ifdef Q_OS_WIN
+const GUID NVVSR_D3D11_EXTENSION_GUID = { 0xD43CE1B3, 0x1F4B, 0x48AC, { 0xBA, 0xEE, 0xC3, 0xC2, 0x53, 0x75, 0xE6, 0xF7 } };
+
+struct NVVSR_EXTENSION_PAYLOAD {
+	UINT enable;
+};
+
+struct VsrContext {
+	~VsrContext() {
+		if (processor) processor->Release();
+		if (enumerator) enumerator->Release();
+		if (videoContext) videoContext->Release();
+		if (videoDevice) videoDevice->Release();
+		if (outputTexture) outputTexture->Release();
+		if (outputView) outputView->Release();
+		if (hwFramesCtx) av_buffer_unref(&hwFramesCtx);
+	}
+	ID3D11VideoDevice *videoDevice = nullptr;
+	ID3D11VideoContext *videoContext = nullptr;
+	ID3D11VideoProcessorEnumerator *enumerator = nullptr;
+	ID3D11VideoProcessor *processor = nullptr;
+	ID3D11Texture2D *outputTexture = nullptr;
+	ID3D11VideoProcessorOutputView *outputView = nullptr;
+	AVBufferRef *hwFramesCtx = nullptr;
+	int width = 0;
+	int height = 0;
+	int outWidth = 0;
+	int outHeight = 0;
+};
+
+bool ApplyVsrUpscale(
+		Stream &stream,
+		not_null<AVFrame*> decodedFrame,
+		not_null<AVFrame*> transferredFrame) {
+	if (decodedFrame->format != AV_PIX_FMT_D3D11) return false;
+
+	auto frames_ctx = (AVHWFramesContext*)decodedFrame->hw_frames_ctx->data;
+	auto device_ctx = (AVHWDeviceContext*)frames_ctx->device_ref->data;
+	if (device_ctx->type != AV_HWDEVICE_TYPE_D3D11VA) return false;
+
+	auto d3d11_device_ctx = (AVD3D11VADeviceContext*)device_ctx->hwctx;
+	ID3D11Device *device = d3d11_device_ctx->device;
+	ID3D11DeviceContext *context = d3d11_device_ctx->device_context;
+
+	if (!stream.vsrContext) {
+		stream.vsrContext = std::make_shared<VsrContext>();
+	}
+	auto vsr = static_cast<VsrContext*>(stream.vsrContext.get());
+
+	if (decodedFrame->width >= 2560 || decodedFrame->height >= 1440) {
+		return false; // Skip if already 2K or larger
+	}
+
+	int outWidth = decodedFrame->width;
+	int outHeight = decodedFrame->height;
+
+	double scaleW = 2560.0 / outWidth;
+	double scaleH = 1440.0 / outHeight;
+	double scale = std::min(scaleW, scaleH);
+
+	if (scale > 1.0) {
+		outWidth = static_cast<int>(std::round(outWidth * scale));
+		outHeight = static_cast<int>(std::round(outHeight * scale));
+		outWidth += outWidth % 2;   // NV12 requires even dimensions
+		outHeight += outHeight % 2;
+	} else {
+		return false;
+	}
+
+	if (!vsr->videoDevice || vsr->width != decodedFrame->width || vsr->height != decodedFrame->height) {
+		if (vsr->processor) { vsr->processor->Release(); vsr->processor = nullptr; }
+		if (vsr->enumerator) { vsr->enumerator->Release(); vsr->enumerator = nullptr; }
+		if (vsr->videoContext) { vsr->videoContext->Release(); vsr->videoContext = nullptr; }
+		if (vsr->videoDevice) { vsr->videoDevice->Release(); vsr->videoDevice = nullptr; }
+		if (vsr->outputTexture) { vsr->outputTexture->Release(); vsr->outputTexture = nullptr; }
+		if (vsr->outputView) { vsr->outputView->Release(); vsr->outputView = nullptr; }
+		if (vsr->hwFramesCtx) { av_buffer_unref(&vsr->hwFramesCtx); }
+
+		vsr->width = decodedFrame->width;
+		vsr->height = decodedFrame->height;
+		vsr->outWidth = outWidth;
+		vsr->outHeight = outHeight;
+
+		HRESULT hr = device->QueryInterface(__uuidof(ID3D11VideoDevice), (void**)&vsr->videoDevice);
+		if (FAILED(hr)) return false;
+
+		hr = context->QueryInterface(__uuidof(ID3D11VideoContext), (void**)&vsr->videoContext);
+		if (FAILED(hr)) return false;
+
+		D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
+		contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+		contentDesc.InputFrameRate = { 60, 1 };
+		contentDesc.InputWidth = vsr->width;
+		contentDesc.InputHeight = vsr->height;
+		contentDesc.OutputWidth = vsr->outWidth;
+		contentDesc.OutputHeight = vsr->outHeight;
+		contentDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+		hr = vsr->videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &vsr->enumerator);
+		if (FAILED(hr)) return false;
+
+		hr = vsr->videoDevice->CreateVideoProcessor(vsr->enumerator, 0, &vsr->processor);
+		if (FAILED(hr)) return false;
+
+		NVVSR_EXTENSION_PAYLOAD payload = { 1 };
+		vsr->videoContext->VideoProcessorSetStreamExtension(vsr->processor, 0, NVVSR_D3D11_EXTENSION_GUID, sizeof(payload), &payload);
+
+		D3D11_TEXTURE2D_DESC texDesc = {};
+		texDesc.Width = vsr->outWidth;
+		texDesc.Height = vsr->outHeight;
+		texDesc.MipLevels = 1;
+		texDesc.ArraySize = 1;
+		texDesc.Format = DXGI_FORMAT_NV12;
+		texDesc.SampleDesc.Count = 1;
+		texDesc.Usage = D3D11_USAGE_DEFAULT;
+		texDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+		hr = device->CreateTexture2D(&texDesc, nullptr, &vsr->outputTexture);
+		if (FAILED(hr)) return false;
+
+		D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
+		ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+		ovDesc.Texture2D.MipSlice = 0;
+
+		hr = vsr->videoDevice->CreateVideoProcessorOutputView(vsr->outputTexture, vsr->enumerator, &ovDesc, &vsr->outputView);
+		if (FAILED(hr)) return false;
+
+		vsr->hwFramesCtx = av_hwframe_ctx_alloc(frames_ctx->device_ref);
+		if (!vsr->hwFramesCtx) return false;
+		auto hwctx = (AVHWFramesContext*)vsr->hwFramesCtx->data;
+		hwctx->format = AV_PIX_FMT_D3D11;
+		hwctx->sw_format = AV_PIX_FMT_NV12;
+		hwctx->width = vsr->outWidth;
+		hwctx->height = vsr->outHeight;
+
+		if (av_hwframe_ctx_init(vsr->hwFramesCtx) < 0) {
+			av_buffer_unref(&vsr->hwFramesCtx);
+			return false;
+		}
+	}
+
+	ID3D11Texture2D *inputTexture = (ID3D11Texture2D*)decodedFrame->data[0];
+	int inputIndex = (intptr_t)decodedFrame->data[1];
+
+	ID3D11VideoProcessorInputView *inputView = nullptr;
+	D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
+	ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+	ivDesc.Texture2D.MipSlice = 0;
+	ivDesc.Texture2D.ArraySlice = inputIndex;
+
+	HRESULT hr = vsr->videoDevice->CreateVideoProcessorInputView(inputTexture, vsr->enumerator, &ivDesc, &inputView);
+	if (FAILED(hr)) return false;
+
+	D3D11_VIDEO_PROCESSOR_STREAM streamData = {};
+	streamData.Enable = TRUE;
+	streamData.OutputIndex = 0;
+	streamData.InputFrameOrField = 0;
+	streamData.PastFrames = 0;
+	streamData.FutureFrames = 0;
+	streamData.pInputSurface = inputView;
+
+	vsr->videoContext->VideoProcessorSetStreamAutoProcessingMode(vsr->processor, 0, TRUE);
+
+	RECT srcRect = { 0, 0, vsr->width, vsr->height };
+	RECT dstRect = { 0, 0, vsr->outWidth, vsr->outHeight };
+	vsr->videoContext->VideoProcessorSetStreamSourceRect(vsr->processor, 0, TRUE, &srcRect);
+	vsr->videoContext->VideoProcessorSetStreamDestRect(vsr->processor, 0, TRUE, &dstRect);
+	vsr->videoContext->VideoProcessorSetOutputTargetRect(vsr->processor, TRUE, &dstRect);
+
+	hr = vsr->videoContext->VideoProcessorBlt(vsr->processor, vsr->outputView, 0, 1, &streamData);
+	inputView->Release();
+	if (FAILED(hr)) return false;
+
+	AVFrame *tempFrame = av_frame_alloc();
+	if (!tempFrame) return false;
+
+	tempFrame->format = AV_PIX_FMT_D3D11;
+	tempFrame->width = vsr->outWidth;
+	tempFrame->height = vsr->outHeight;
+	tempFrame->hw_frames_ctx = av_buffer_ref(vsr->hwFramesCtx);
+	tempFrame->data[0] = (uint8_t*)vsr->outputTexture;
+	tempFrame->data[1] = 0;
+
+	int err = av_hwframe_transfer_data(transferredFrame, tempFrame, 0);
+	av_frame_free(&tempFrame);
+
+	return err == 0;
+}
+#endif
+
 bool TransferFrame(
 		Stream &stream,
 		not_null<AVFrame*> decodedFrame,
 		not_null<AVFrame*> transferredFrame) {
 	Expects(decodedFrame->hw_frames_ctx != nullptr);
+
+#ifdef Q_OS_WIN
+	if (ApplyVsrUpscale(stream, decodedFrame, transferredFrame)) {
+		FFmpeg::ClearFrameMemory(decodedFrame);
+		return true;
+	}
+#endif
 
 	const auto error = FFmpeg::AvErrorWrap(
 		av_hwframe_transfer_data(transferredFrame, decodedFrame, 0));

@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "media/streaming/media_streaming_common.h"
 #include "ffmpeg/ffmpeg_utility.h"
+#include <memory>
 
 namespace Media {
 namespace Streaming {
@@ -43,6 +44,10 @@ struct Stream {
 	AVRational aspect = FFmpeg::kNormalAspect;
 	float64 fps = 0.;
 	FFmpeg::SwscalePointer swscale;
+
+#ifdef Q_OS_WIN
+	std::shared_ptr<void> vsrContext;
+#endif
 };
 
 [[nodiscard]] crl::time FramePosition(const Stream &stream);
