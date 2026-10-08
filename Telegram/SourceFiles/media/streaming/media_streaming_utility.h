@@ -45,8 +45,9 @@ struct Stream {
 	float64 fps = 0.;
 	FFmpeg::SwscalePointer swscale;
 
-#ifdef Q_OS_WIN
+#if defined(Q_OS_WIN) && defined(_WIN64) && (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
 	std::shared_ptr<void> vsrContext;
+	bool vsrDisabled = false;
 #endif
 };
 
