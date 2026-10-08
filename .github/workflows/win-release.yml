@@ -60,7 +60,6 @@ jobs:
           git config --global user.name "Sample"
 
       - name: Install VS 2026 Build Tools.
-        if: matrix.arch == 'arm64'
         shell: pwsh
         run: |
           $exe = Join-Path $env:RUNNER_TEMP 'vs_buildtools.exe'
