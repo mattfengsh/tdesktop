@@ -14,6 +14,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/rect.h"
 #include "styles/style_chat.h"
 #include "styles/style_chat_style.h"
+#include "ui/text/format_values.h"
 
 namespace HistoryView {
 
@@ -167,6 +168,46 @@ void PaintVideoTimestampMark(
 		p.restore();
 	}
 	p.restore();
+}
+
+void PaintVideoDurationBadge(
+		Painter &p,
+		const Ui::ChatPaintContext &context,
+		QRect rect,
+		int outerWidth,
+		crl::time duration) {
+	if (duration <= 0) {
+		return;
+	}
+	const auto st = context.st;
+	const auto sti = context.imageStyle();
+	const auto &font = st::normalFont;
+	const auto text = Ui::FormatDurationText(duration / 1000);
+	const auto padding = st::msgDateImgPadding;
+	const auto textWidth = font->width(text);
+	const auto badgeWidth = textWidth + 2 * padding.x();
+	const auto badgeHeight = font->height + 2 * padding.y();
+	if (rect.width() < badgeWidth + 2 * st::msgDateImgDelta
+		|| rect.height() < badgeHeight + 2 * st::msgDateImgDelta) {
+		return;
+	}
+	const auto badgeX = rect.x() + st::msgDateImgDelta + padding.x();
+	const auto badgeY = rect.y() + rect.height() - st::msgDateImgDelta - badgeHeight + padding.y();
+	const auto around = style::rtlrect(
+		badgeX - padding.x(),
+		badgeY - padding.y(),
+		badgeWidth,
+		badgeHeight,
+		outerWidth);
+	Ui::FillRoundRect(p, around, sti->msgDateImgBg, sti->msgDateImgBgCorners);
+	p.setFont(font);
+	p.setPen(st->msgDateImgFg());
+	p.drawTextLeft(
+		badgeX,
+		badgeY,
+		outerWidth,
+		text,
+		textWidth);
 }
 
 } // namespace HistoryView
