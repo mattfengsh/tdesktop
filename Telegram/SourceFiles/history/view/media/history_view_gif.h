@@ -250,6 +250,10 @@ private:
 		Painter &p,
 		const PaintContext &context,
 		QPoint position) const;
+	void drawDurationBadge(
+		Painter &p,
+		const PaintContext &context,
+		QRect geometry) const;
 	[[nodiscard]] TextState cornerStatusTextState(
 		QPoint point,
 		StateRequest request,

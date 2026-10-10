@@ -938,6 +938,12 @@ void Gif::draw(Painter &p, const PaintContext &context) const {
 				drawCornerStatus(p, context, QPoint());
 			}
 		}
+		if (_data->isVideoFile() && !ttlCovered) {
+			drawDurationBadge(
+				p,
+				context,
+				QRect(usex + paintx, painty, usew, painth));
+		}
 	} else if (!skipDrawingSurrounding) {
 		if (isRound && !mediaEditor) {
 			const auto mediaUnread = item->hasUnreadMediaFlag();
@@ -1988,6 +1994,9 @@ void Gif::drawGrouped(
 	if (!_smallGroupPart && !mediaEditor) {
 		drawCornerStatus(p, context, geometry.topLeft());
 	}
+	if (_data->isVideoFile()) {
+		drawDurationBadge(p, context, geometry);
+	}
 }
 
 TextState Gif::getStateGrouped(
@@ -2717,9 +2726,38 @@ bool Gif::needInfoDisplay() const {
 		|| (!_parent->hasBubble() && _parent->isLastAndSelfMessage());
 }
 
+void Gif::drawDurationBadge(
+		Painter &p,
+		const PaintContext &context,
+		QRect geometry) const {
+	if (!_data->isVideoFile() || !_data->hasDuration()) {
+		return;
+	}
+	const auto revealed = revealedProgress();
+	if (revealed <= 0.) {
+		return;
+	}
+	if (revealed < 1.) {
+		p.setOpacity(revealed);
+	}
+	PaintVideoDurationBadge(
+		p,
+		context,
+		geometry,
+		width(),
+		_data->duration());
+	if (revealed < 1.) {
+		p.setOpacity(1.);
+	}
+}
+
 bool Gif::needCornerStatusDisplay() const {
-	return _data->isVideoFile()
-		|| needInfoDisplay();
+	if (_data->isVideoFile()) {
+		return (downloadInCorner() && !dataLoaded() && !_data->loadedInMediaCache())
+			|| _streamed
+			|| _data->loading();
+	}
+	return needInfoDisplay();
 }
 
 void Gif::ensureTranscribeButton() const {

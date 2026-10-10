@@ -43,4 +43,11 @@ void PaintVideoTimestampMark(
 	crl::time position,
 	crl::time duration);
 
+void PaintVideoDurationBadge(
+	Painter &p,
+	const Ui::ChatPaintContext &context,
+	QRect rect,
+	int outerWidth,
+	crl::time duration);
+
 } // namespace HistoryView
