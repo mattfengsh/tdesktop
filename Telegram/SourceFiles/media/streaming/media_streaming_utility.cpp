@@ -12,6 +12,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/painter.h"
 #include "ffmpeg/ffmpeg_utility.h"
 
+#include <cmath>
+
+#if defined(Q_OS_WIN) && defined(_WIN64) && (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
+#include <d3d11.h>
+#include <d3d11_1.h>
+#include <dxgi.h>
+extern "C" {
+#include <libavutil/hwcontext_d3d11va.h>
+}
+#endif
 namespace Media {
 namespace Streaming {
 namespace {
@@ -115,11 +125,403 @@ bool GoodForRequest(
 	return (size == request.outer) && (size == image.size());
 }
 
+#if defined(Q_OS_WIN) && defined(_WIN64) && (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
+constexpr GUID kNvidiaPPEInterfaceGUID = {
+	0xd43ce1b3,
+	0x1f4b,
+	0x48ac,
+	{ 0xba, 0xee, 0xc3, 0xc2, 0x53, 0x75, 0xe6, 0xf7 }
+};
+constexpr UINT kStreamExtensionVersionV1 = 0x1;
+constexpr UINT kStreamExtensionMethodSuperResolution = 0x2;
+
+struct VsrStreamExtensionInfo {
+	UINT version = kStreamExtensionVersionV1;
+	UINT method = kStreamExtensionMethodSuperResolution;
+	UINT enable = 1;
+};
+
+struct VsrContext {
+	~VsrContext() {
+		release();
+	}
+
+	void release() {
+		if (inputView) {
+			inputView->Release();
+			inputView = nullptr;
+		}
+		if (outputView) {
+			outputView->Release();
+			outputView = nullptr;
+		}
+		if (outputTexture) {
+			outputTexture->Release();
+			outputTexture = nullptr;
+		}
+		if (stagingTexture) {
+			stagingTexture->Release();
+			stagingTexture = nullptr;
+		}
+		if (processor) {
+			processor->Release();
+			processor = nullptr;
+		}
+		if (enumerator) {
+			enumerator->Release();
+			enumerator = nullptr;
+		}
+		if (videoContext) {
+			videoContext->Release();
+			videoContext = nullptr;
+		}
+		if (videoDevice) {
+			videoDevice->Release();
+			videoDevice = nullptr;
+		}
+		width = 0;
+		height = 0;
+		outWidth = 0;
+		outHeight = 0;
+		lastInputTexture = nullptr;
+		lastInputIndex = -1;
+	}
+
+	ID3D11VideoDevice *videoDevice = nullptr;
+	ID3D11VideoContext *videoContext = nullptr;
+	ID3D11VideoProcessorEnumerator *enumerator = nullptr;
+	ID3D11VideoProcessor *processor = nullptr;
+	ID3D11Texture2D *outputTexture = nullptr;
+	ID3D11Texture2D *stagingTexture = nullptr;
+	ID3D11VideoProcessorOutputView *outputView = nullptr;
+	ID3D11VideoProcessorInputView *inputView = nullptr;
+
+	ID3D11Texture2D *lastInputTexture = nullptr;
+	int lastInputIndex = -1;
+
+	int width = 0;
+	int height = 0;
+	int outWidth = 0;
+	int outHeight = 0;
+};
+
+bool ApplyVsrUpscale(
+		Stream &stream,
+		not_null<AVFrame*> decodedFrame,
+		not_null<AVFrame*> transferredFrame) {
+	if (stream.vsrDisabled) {
+		return false;
+	}
+	if (decodedFrame->format != AV_PIX_FMT_D3D11 || !decodedFrame->hw_frames_ctx) {
+		return false;
+	}
+
+	const auto frames_ctx = reinterpret_cast<AVHWFramesContext*>(
+		decodedFrame->hw_frames_ctx->data);
+	if (!frames_ctx || !frames_ctx->device_ref) {
+		return false;
+	}
+	const auto device_ctx = reinterpret_cast<AVHWDeviceContext*>(
+		frames_ctx->device_ref->data);
+	if (!device_ctx || device_ctx->type != AV_HWDEVICE_TYPE_D3D11VA) {
+		return false;
+	}
+
+	const auto d3d11_device_ctx = reinterpret_cast<AVD3D11VADeviceContext*>(
+		device_ctx->hwctx);
+	if (!d3d11_device_ctx) {
+		return false;
+	}
+	ID3D11Device *device = d3d11_device_ctx->device;
+	ID3D11DeviceContext *context = d3d11_device_ctx->device_context;
+	if (!device || !context) {
+		return false;
+	}
+
+	const int inWidth = decodedFrame->width;
+	const int inHeight = decodedFrame->height;
+	if (inWidth <= 0 || inHeight <= 0) {
+		return false;
+	}
+
+	const bool isPortrait = (inHeight > inWidth);
+	const int maxBoundW = isPortrait ? 1440 : 2560;
+	const int maxBoundH = isPortrait ? 2560 : 1440;
+
+	if (inWidth >= maxBoundW && inHeight >= maxBoundH) {
+		return false;
+	}
+
+	const double scaleW = double(maxBoundW) / inWidth;
+	const double scaleH = double(maxBoundH) / inHeight;
+	const double scale = std::min(scaleW, scaleH);
+	if (scale <= 1.0) {
+		return false;
+	}
+
+	int outWidth = static_cast<int>(std::round(inWidth * scale));
+	int outHeight = static_cast<int>(std::round(inHeight * scale));
+	outWidth += (outWidth % 2);
+	outHeight += (outHeight % 2);
+
+	if (!stream.vsrContext) {
+		stream.vsrContext = std::make_shared<VsrContext>();
+	}
+	auto vsr = static_cast<VsrContext*>(stream.vsrContext.get());
+
+	if (!vsr->videoDevice || vsr->width != inWidth || vsr->height != inHeight || vsr->outWidth != outWidth || vsr->outHeight != outHeight) {
+		vsr->release();
+
+		IDXGIDevice *dxgiDevice = nullptr;
+		HRESULT hr = device->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void**>(&dxgiDevice));
+		if (FAILED(hr) || !dxgiDevice) {
+			stream.vsrDisabled = true;
+			return false;
+		}
+		IDXGIAdapter *dxgiAdapter = nullptr;
+		hr = dxgiDevice->GetAdapter(&dxgiAdapter);
+		dxgiDevice->Release();
+		if (FAILED(hr) || !dxgiAdapter) {
+			stream.vsrDisabled = true;
+			return false;
+		}
+		DXGI_ADAPTER_DESC adapterDesc = {};
+		hr = dxgiAdapter->GetDesc(&adapterDesc);
+		dxgiAdapter->Release();
+		if (FAILED(hr) || adapterDesc.VendorId != 0x10DE) {
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		vsr->width = inWidth;
+		vsr->height = inHeight;
+		vsr->outWidth = outWidth;
+		vsr->outHeight = outHeight;
+
+		hr = device->QueryInterface(__uuidof(ID3D11VideoDevice), reinterpret_cast<void**>(&vsr->videoDevice));
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		hr = context->QueryInterface(__uuidof(ID3D11VideoContext), reinterpret_cast<void**>(&vsr->videoContext));
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		D3D11_VIDEO_PROCESSOR_CONTENT_DESC contentDesc = {};
+		contentDesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
+		contentDesc.InputFrameRate = { 60, 1 };
+		contentDesc.InputWidth = vsr->width;
+		contentDesc.InputHeight = vsr->height;
+		contentDesc.OutputWidth = vsr->outWidth;
+		contentDesc.OutputHeight = vsr->outHeight;
+		contentDesc.Usage = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
+
+		hr = vsr->videoDevice->CreateVideoProcessorEnumerator(&contentDesc, &vsr->enumerator);
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		UINT inFlags = 0;
+		hr = vsr->enumerator->CheckVideoProcessorFormat(DXGI_FORMAT_NV12, &inFlags);
+		if (FAILED(hr) || !(inFlags & D3D11_VIDEO_PROCESSOR_FORMAT_SUPPORT_INPUT)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		hr = vsr->videoDevice->CreateVideoProcessor(vsr->enumerator, 0, &vsr->processor);
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		VsrStreamExtensionInfo extensionPayload;
+		hr = vsr->videoContext->VideoProcessorSetStreamExtension(
+			vsr->processor,
+			0,
+			&kNvidiaPPEInterfaceGUID,
+			sizeof(extensionPayload),
+			&extensionPayload);
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC texDesc = {};
+		texDesc.Width = vsr->outWidth;
+		texDesc.Height = vsr->outHeight;
+		texDesc.MipLevels = 1;
+		texDesc.ArraySize = 1;
+		texDesc.Format = DXGI_FORMAT_NV12;
+		texDesc.SampleDesc.Count = 1;
+		texDesc.Usage = D3D11_USAGE_DEFAULT;
+		texDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+		hr = device->CreateTexture2D(&texDesc, nullptr, &vsr->outputTexture);
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc = {};
+		ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+		ovDesc.Texture2D.MipSlice = 0;
+
+		hr = vsr->videoDevice->CreateVideoProcessorOutputView(
+			vsr->outputTexture,
+			vsr->enumerator,
+			&ovDesc,
+			&vsr->outputView);
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+
+		D3D11_TEXTURE2D_DESC stagingDesc = {};
+		stagingDesc.Width = vsr->outWidth;
+		stagingDesc.Height = vsr->outHeight;
+		stagingDesc.MipLevels = 1;
+		stagingDesc.ArraySize = 1;
+		stagingDesc.Format = DXGI_FORMAT_NV12;
+		stagingDesc.SampleDesc.Count = 1;
+		stagingDesc.Usage = D3D11_USAGE_STAGING;
+		stagingDesc.BindFlags = 0;
+		stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+		hr = device->CreateTexture2D(&stagingDesc, nullptr, &vsr->stagingTexture);
+		if (FAILED(hr)) {
+			vsr->release();
+			stream.vsrDisabled = true;
+			return false;
+		}
+	}
+
+	ID3D11Texture2D *inputTexture = reinterpret_cast<ID3D11Texture2D*>(decodedFrame->data[0]);
+	const int inputIndex = static_cast<int>(reinterpret_cast<intptr_t>(decodedFrame->data[1]));
+	if (!inputTexture) {
+		return false;
+	}
+
+	if (!vsr->inputView || inputTexture != vsr->lastInputTexture || inputIndex != vsr->lastInputIndex) {
+		if (vsr->inputView) {
+			vsr->inputView->Release();
+			vsr->inputView = nullptr;
+		}
+		D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC ivDesc = {};
+		ivDesc.ViewDimension = D3D11_VPIV_DIMENSION_TEXTURE2D;
+		ivDesc.Texture2D.MipSlice = 0;
+		ivDesc.Texture2D.ArraySlice = inputIndex;
+
+		HRESULT hr = vsr->videoDevice->CreateVideoProcessorInputView(
+			inputTexture,
+			vsr->enumerator,
+			&ivDesc,
+			&vsr->inputView);
+		if (FAILED(hr)) {
+			return false;
+		}
+		vsr->lastInputTexture = inputTexture;
+		vsr->lastInputIndex = inputIndex;
+	}
+
+	D3D11_VIDEO_PROCESSOR_STREAM streamData = {};
+	streamData.Enable = TRUE;
+	streamData.OutputIndex = 0;
+	streamData.InputFrameOrField = 0;
+	streamData.PastFrames = 0;
+	streamData.FutureFrames = 0;
+	streamData.pInputSurface = vsr->inputView;
+
+	RECT srcRect = { 0, 0, vsr->width, vsr->height };
+	RECT dstRect = { 0, 0, vsr->outWidth, vsr->outHeight };
+	vsr->videoContext->VideoProcessorSetStreamSourceRect(vsr->processor, 0, TRUE, &srcRect);
+	vsr->videoContext->VideoProcessorSetStreamDestRect(vsr->processor, 0, TRUE, &dstRect);
+	vsr->videoContext->VideoProcessorSetOutputTargetRect(vsr->processor, TRUE, &dstRect);
+
+	HRESULT hr = vsr->videoContext->VideoProcessorBlt(
+		vsr->processor,
+		vsr->outputView,
+		0,
+		1,
+		&streamData);
+	if (FAILED(hr)) {
+		return false;
+	}
+
+	context->CopyResource(vsr->stagingTexture, vsr->outputTexture);
+
+	D3D11_MAPPED_SUBRESOURCE mapped = {};
+	hr = context->Map(vsr->stagingTexture, 0, D3D11_MAP_READ, 0, &mapped);
+	if (FAILED(hr)) {
+		return false;
+	}
+
+	av_frame_unref(transferredFrame);
+	transferredFrame->format = AV_PIX_FMT_NV12;
+	transferredFrame->width = vsr->outWidth;
+	transferredFrame->height = vsr->outHeight;
+	if (av_frame_get_buffer(transferredFrame, 32) < 0) {
+		context->Unmap(vsr->stagingTexture, 0);
+		return false;
+	}
+
+	const uint8_t *srcY = reinterpret_cast<const uint8_t*>(mapped.pData);
+	uint8_t *dstY = transferredFrame->data[0];
+	const int widthBytes = vsr->outWidth;
+	for (int y = 0; y < vsr->outHeight; ++y) {
+		memcpy(dstY, srcY, widthBytes);
+		srcY += mapped.RowPitch;
+		dstY += transferredFrame->linesize[0];
+	}
+
+	const uint8_t *srcUV = reinterpret_cast<const uint8_t*>(mapped.pData) + static_cast<size_t>(mapped.RowPitch) * vsr->outHeight;
+	uint8_t *dstUV = transferredFrame->data[1];
+	const int uvHeight = vsr->outHeight / 2;
+	for (int y = 0; y < uvHeight; ++y) {
+		memcpy(dstUV, srcUV, widthBytes);
+		srcUV += mapped.RowPitch;
+		dstUV += transferredFrame->linesize[1];
+	}
+
+	context->Unmap(vsr->stagingTexture, 0);
+
+	transferredFrame->pts = decodedFrame->pts;
+	transferredFrame->pkt_dts = decodedFrame->pkt_dts;
+	transferredFrame->best_effort_timestamp = decodedFrame->best_effort_timestamp;
+	transferredFrame->sample_aspect_ratio = decodedFrame->sample_aspect_ratio;
+	transferredFrame->color_primaries = decodedFrame->color_primaries;
+	transferredFrame->color_trc = decodedFrame->color_trc;
+	transferredFrame->colorspace = decodedFrame->colorspace;
+	transferredFrame->color_range = decodedFrame->color_range;
+	transferredFrame->chroma_location = decodedFrame->chroma_location;
+
+	return true;
+}
+#endif
+
 bool TransferFrame(
 		Stream &stream,
 		not_null<AVFrame*> decodedFrame,
 		not_null<AVFrame*> transferredFrame) {
 	Expects(decodedFrame->hw_frames_ctx != nullptr);
+
+#if defined(Q_OS_WIN) && defined(_WIN64) && (QT_VERSION >= QT_VERSION_CHECK(6, 0, 0))
+	if (ApplyVsrUpscale(stream, decodedFrame, transferredFrame)) {
+		FFmpeg::ClearFrameMemory(decodedFrame);
+		return true;
+	}
+#endif
 
 	const auto error = FFmpeg::AvErrorWrap(
 		av_hwframe_transfer_data(transferredFrame, decodedFrame, 0));
